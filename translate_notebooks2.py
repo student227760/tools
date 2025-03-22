@@ -23,14 +23,15 @@ Jupyter Notebook Markdownセル・コードセル 自動翻訳スクリプト
 1. 必要なライブラリをインストール
    pip install googletrans==4.0.0-rc1 google-cloud-translate==3.11.2 typer[all]
 
-2. Google Cloud Translation API を利用する場合は、環境変数にAPIキーを設定
-   export GOOGLE_API_KEY="あなたのAPIキー"
+2. Google Cloud Translation API を利用する場合は、サービスアカウントの認証情報を使用してください。
+   サービスアカウントキーのJSONファイルを取得し、環境変数 GOOGLE_APPLICATION_CREDENTIALS にそのファイルパスを設定します。
+   (例: export GOOGLE_APPLICATION_CREDENTIALS="/path/to/your/service-account.json")
 
 3. 実行例
-   # googletrans を使う場合（コードセルの文字列リテラルは翻訳しない）
+   # googletrans を使う場合（コードセルは翻訳しない）
    python translate_notebooks.py --directory /path/to/notebook-directory --engine googletrans
 
-   # gcloud を使い、コードセル内の20文字以上の文字列リテラルも翻訳する場合
+   # gcloud を使い、コードセル内の文字列リテラルも翻訳する場合
    python translate_notebooks.py --directory /path/to/notebook-directory --engine gcloud --translate-code
 --------------------------------------------------
 """
@@ -40,7 +41,7 @@ import json
 import time
 import logging
 import re
-from typing import Optional, Literal
+from typing import Optional
 from abc import ABC, abstractmethod
 import typer
 
@@ -86,16 +87,19 @@ class GoogletransTranslator(TranslatorInterface):
         return text
 
 # ----------------------------------------
-# Google Cloud Translation API 実装
+# Google Cloud Translation API 実装 (using service account credentials)
 # ----------------------------------------
 class GoogleCloudTranslator(TranslatorInterface):
     def __init__(self):
         from google.cloud import translate_v2 as translate
-        api_key = os.environ.get('GOOGLE_API_KEY')
-        if not api_key:
-            logger.error("環境変数 'GOOGLE_API_KEY' が設定されていません。")
-            raise EnvironmentError("GOOGLE_API_KEY not set")
-        self.client = translate.Client(api_key=api_key)
+        # Check for service account credentials
+        credentials_path = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')
+        if not credentials_path:
+            logger.error("Environment variable 'GOOGLE_APPLICATION_CREDENTIALS' is not set. "
+                         "Please set it to the path of your service account JSON file.")
+            raise EnvironmentError("GOOGLE_APPLICATION_CREDENTIALS not set. "
+                                   "See https://cloud.google.com/docs/authentication/getting-started for more details.")
+        self.client = translate.Client()
 
     def translate(self, text: str, target_lang: str = 'ja') -> str:
         if not text.strip():
@@ -108,10 +112,8 @@ class GoogleCloudTranslator(TranslatorInterface):
             logger.error(f"[gcloud] Translation failed: {e}")
             return text
 
-# 型エイリアス: 翻訳エンジンの種類
-EngineType = Literal['googletrans', 'gcloud']
-
-def get_translator(engine: EngineType) -> TranslatorInterface:
+# get_translator returns a TranslatorInterface based on the engine string
+def get_translator(engine: str) -> TranslatorInterface:
     if engine == 'googletrans':
         return GoogletransTranslator()
     elif engine == 'gcloud':
@@ -142,7 +144,6 @@ def translate_code_cell_source(source: list[str], translator: TranslatorInterfac
             return match.group(0)
     
     new_code_text = STRING_LITERAL_RE.sub(replacer, code_text)
-    # 改行を維持してリストに戻す
     return new_code_text.splitlines(keepends=True)
 
 # ----------------------------------------
@@ -160,14 +161,12 @@ def translate_notebook_cells(input_path: str, translator: TranslatorInterface, t
     translated_any = False
     for cell in notebook.get('cells', []):
         cell_type = cell.get('cell_type')
-        # Markdownセルは常に翻訳
         if cell_type == 'markdown':
             original_text = ''.join(cell.get('source', []))
             translated_text = translator.translate(original_text)
             if translated_text != original_text:
                 translated_any = True
                 cell['source'] = [translated_text]
-        # コードセルはオプション処理
         elif cell_type == 'code' and translate_code:
             original_source = cell.get('source', [])
             new_source = translate_code_cell_source(original_source, translator, min_length=20)
@@ -208,13 +207,16 @@ app = typer.Typer()
 @app.command()
 def main(
     directory: str = typer.Option(..., help="対象となるディレクトリのパス（.ipynbファイルを含む）"),
-    engine: EngineType = typer.Option('googletrans', help="翻訳エンジン ('googletrans' または 'gcloud')"),
+    engine: str = typer.Option('googletrans', help="翻訳エンジン ('googletrans' または 'gcloud')"),
     translate_code: bool = typer.Option(False, help="コードセル内の文字列リテラル（20文字以上）も翻訳する場合は True")
 ) -> None:
     """
     指定したディレクトリ内のJupyter NotebookのMarkdownセルを日本語に翻訳します。
     オプションで、コードセル内の文字列リテラル（20文字以上）の翻訳も可能です。
     """
+    allowed_engines = ['googletrans', 'gcloud']
+    if engine not in allowed_engines:
+        raise typer.BadParameter(f"Engine must be one of {allowed_engines}")
     translator = get_translator(engine)
     translate_notebooks_in_directory(directory, translator, translate_code)
 
