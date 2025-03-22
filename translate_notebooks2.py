@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-Jupyter Notebook Markdownセル 自動翻訳スクリプト
+Jupyter Notebook Markdownセル・コードセル 自動翻訳スクリプト
 
 ディレクトリ内のJupyter Notebook（.ipynb）ファイルのMarkdownセルを自動で日本語に翻訳し、
-新たに翻訳済みファイル（translated_ファイル名.ipynb）を作成します。
+新たに翻訳済みファイル（jp_ファイル名.ipynb）を作成します。
 
 翻訳エンジンは、以下の2種類から選択可能です:
 - googletrans (非公式Google翻訳APIライブラリ)
@@ -13,8 +13,10 @@ Jupyter Notebook Markdownセル 自動翻訳スクリプト
 
 【主な機能】
 - ディレクトリ内の.ipynbファイルを一括処理
-- Markdownセルのみ日本語に翻訳
+- Markdownセルを日本語に翻訳
+- オプションで、コードセル内の文字列リテラル（20文字以上）も翻訳
 - 翻訳エンジンを柔軟に切り替え可能（--engine オプション）
+- Typer を用いたモダンなCLI
 
 【使い方】
 --------------------------------------------------
@@ -25,11 +27,11 @@ Jupyter Notebook Markdownセル 自動翻訳スクリプト
    export GOOGLE_API_KEY="あなたのAPIキー"
 
 3. 実行例
-   # googletrans を使う場合
+   # googletrans を使う場合（コードセルの文字列リテラルは翻訳しない）
    python translate_notebooks.py --directory /path/to/notebook-directory --engine googletrans
 
-   # Google Cloud Translation API を使う場合
-   python translate_notebooks.py --directory /path/to/notebook-directory --engine gcloud
+   # gcloud を使い、コードセル内の20文字以上の文字列リテラルも翻訳する場合
+   python translate_notebooks.py --directory /path/to/notebook-directory --engine gcloud --translate-code
 --------------------------------------------------
 """
 
@@ -37,6 +39,7 @@ import os
 import json
 import time
 import logging
+import re
 from typing import Optional, Literal
 from abc import ABC, abstractmethod
 import typer
@@ -117,9 +120,35 @@ def get_translator(engine: EngineType) -> TranslatorInterface:
         raise ValueError(f"Unsupported engine: {engine}")
 
 # ----------------------------------------
-# NotebookのMarkdownセル翻訳処理
+# コードセル内の文字列リテラル翻訳（正規表現ベース）
 # ----------------------------------------
-def translate_markdown_cells(input_path: str, translator: TranslatorInterface, output_path: Optional[str] = None) -> None:
+STRING_LITERAL_RE = re.compile(r"(?P<quote>['\"]{1,3})(?P<content>.*?)(?P=quote)", re.DOTALL)
+
+def translate_code_cell_source(source: list[str], translator: TranslatorInterface, min_length: int = 20) -> list[str]:
+    """
+    コードセルのソースから文字列リテラルを検出し、
+    20文字以上の場合に翻訳する。
+    """
+    code_text = "".join(source)
+    
+    def replacer(match: re.Match) -> str:
+        quote = match.group("quote")
+        content = match.group("content")
+        if len(content) >= min_length:
+            translated = translator.translate(content)
+            logger.debug(f"[code] Translated literal: {content[:20]}... -> {translated[:20]}...")
+            return f"{quote}{translated}{quote}"
+        else:
+            return match.group(0)
+    
+    new_code_text = STRING_LITERAL_RE.sub(replacer, code_text)
+    # 改行を維持してリストに戻す
+    return new_code_text.splitlines(keepends=True)
+
+# ----------------------------------------
+# Notebookのセル翻訳処理（Markdown＋オプションでコードセル）
+# ----------------------------------------
+def translate_notebook_cells(input_path: str, translator: TranslatorInterface, translate_code: bool = False, output_path: Optional[str] = None) -> None:
     logger.info(f"Loading notebook: {input_path}")
     try:
         with open(input_path, 'r', encoding='utf-8') as f:
@@ -130,12 +159,21 @@ def translate_markdown_cells(input_path: str, translator: TranslatorInterface, o
 
     translated_any = False
     for cell in notebook.get('cells', []):
-        if cell.get('cell_type') == 'markdown':
+        cell_type = cell.get('cell_type')
+        # Markdownセルは常に翻訳
+        if cell_type == 'markdown':
             original_text = ''.join(cell.get('source', []))
             translated_text = translator.translate(original_text)
             if translated_text != original_text:
                 translated_any = True
                 cell['source'] = [translated_text]
+        # コードセルはオプション処理
+        elif cell_type == 'code' and translate_code:
+            original_source = cell.get('source', [])
+            new_source = translate_code_cell_source(original_source, translator, min_length=20)
+            if "".join(new_source) != "".join(original_source):
+                translated_any = True
+                cell['source'] = new_source
 
     if not output_path:
         dirname, filename = os.path.split(input_path)
@@ -149,9 +187,9 @@ def translate_markdown_cells(input_path: str, translator: TranslatorInterface, o
         except Exception as e:
             logger.error(f"Failed to save translated notebook: {e}")
     else:
-        logger.info(f"No markdown cells translated in {input_path}")
+        logger.info(f"No cells were translated in {input_path}")
 
-def translate_notebooks_in_directory(directory: str, translator: TranslatorInterface) -> None:
+def translate_notebooks_in_directory(directory: str, translator: TranslatorInterface, translate_code: bool = False) -> None:
     if not os.path.isdir(directory):
         logger.error(f"Directory not found: {directory}")
         return
@@ -160,7 +198,7 @@ def translate_notebooks_in_directory(directory: str, translator: TranslatorInter
     for filename in os.listdir(directory):
         if filename.endswith('.ipynb'):
             input_path = os.path.join(directory, filename)
-            translate_markdown_cells(input_path, translator)
+            translate_notebook_cells(input_path, translator, translate_code)
 
 # ----------------------------------------
 # Typer CLI エントリポイント
@@ -169,14 +207,16 @@ app = typer.Typer()
 
 @app.command()
 def main(
-    directory: str = typer.Option(..., help="ディレクトリ内の.ipynbファイルを対象とするパス"),
-    engine: EngineType = typer.Option('googletrans', help="翻訳エンジン ('googletrans' または 'gcloud')")
+    directory: str = typer.Option(..., help="対象となるディレクトリのパス（.ipynbファイルを含む）"),
+    engine: EngineType = typer.Option('googletrans', help="翻訳エンジン ('googletrans' または 'gcloud')"),
+    translate_code: bool = typer.Option(False, help="コードセル内の文字列リテラル（20文字以上）も翻訳する場合は True")
 ) -> None:
     """
     指定したディレクトリ内のJupyter NotebookのMarkdownセルを日本語に翻訳します。
+    オプションで、コードセル内の文字列リテラル（20文字以上）の翻訳も可能です。
     """
     translator = get_translator(engine)
-    translate_notebooks_in_directory(directory, translator)
+    translate_notebooks_in_directory(directory, translator, translate_code)
 
 if __name__ == "__main__":
     app()
